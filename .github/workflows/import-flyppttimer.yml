@@ -39,6 +39,7 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git clone --depth=1 --branch main "https://github.com/${SOURCE_REPO}.git" /tmp/flyppttimer-source
           rsync -a --delete --exclude='.git/' /tmp/flyppttimer-source/ ./
+          rm -f .github/workflows/mirror-gitee-release.yml
           python3 - <<'PY'
           from pathlib import Path
           original = 'https://github.com/Hona-Cao/FlyPPTTimer'
