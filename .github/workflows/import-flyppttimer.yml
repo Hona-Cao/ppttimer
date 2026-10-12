@@ -1,0 +1,148 @@
+name: Import FlyPPTTimer content and releases (one time)
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/import-flyppttimer.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: import-flyppttimer-once
+  cancel-in-progress: false
+
+jobs:
+  import:
+    if: github.repository == 'Hona-Cao/ppttimer'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_REPO: Hona-Cao/FlyPPTTimer
+      DEST_REPO: Hona-Cao/ppttimer
+
+    steps:
+      - name: Check out the existing fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Replace all tracked content with FlyPPTTimer main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git clone --depth=1 --branch main "https://github.com/${SOURCE_REPO}.git" /tmp/flyppttimer-source
+          rsync -a --delete --exclude='.git/' /tmp/flyppttimer-source/ ./
+          python3 - <<'PY'
+          from pathlib import Path
+          original = 'https://github.com/Hona-Cao/FlyPPTTimer'
+          new = 'https://github.com/Hona-Cao/ppttimer'
+          for name, notice in (
+              ('README.md', '\n> **Repository note:** This repository keeps its GitHub fork relationship with [old9/ppttimer](https://github.com/old9/ppttimer), but its present contents are **FlyPPTTimer by Hona-Cao**, an independent Windows presentation timer. The historical old9 code remains in Git history under its original MIT license; current FlyPPTTimer content is governed by [LICENSE](LICENSE).\n'),
+              ('README.zh-CN.md', '\n> **仓库说明：** 本仓库在 GitHub 上仍保留与 [old9/ppttimer](https://github.com/old9/ppttimer) 的 Fork 关联，但当前文件已替换为 **Hona-Cao 的 FlyPPTTimer**，不是原版 AutoHotkey 项目。旧版本代码仍保留在 Git 历史中并适用其原有 MIT 许可证；当前 FlyPPTTimer 内容以 [LICENSE](LICENSE) 为准。\n'),
+          ):
+              path = Path(name)
+              data = path.read_text(encoding='utf-8')
+              data = data.replace(original, new)
+              marker = '</div>'
+              if marker in data and notice.strip() not in data:
+                  data = data.replace(marker, marker + '\n' + notice, 1)
+              path.write_text(data, encoding='utf-8')
+          PY
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Replace fork contents with FlyPPTTimer"
+            git push origin HEAD:master
+          fi
+
+      - name: Copy all upstream FlyPPTTimer version tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C /tmp/flyppttimer-source fetch --force origin '+refs/tags/*:refs/tags/*'
+          git fetch /tmp/flyppttimer-source '+refs/tags/*:refs/tags/*'
+          git push origin --tags
+
+      - name: Recreate published GitHub releases with notes and downloadable assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import tempfile
+
+          source = os.environ['SOURCE_REPO']
+          dest = os.environ['DEST_REPO']
+          def gh(*args, capture=False):
+              cmd = ['gh', *map(str, args)]
+              return subprocess.check_output(cmd, text=True) if capture else subprocess.run(cmd, check=True)
+
+          releases = json.loads(gh('api', f'repos/{source}/releases?per_page=100', capture=True))
+          releases.sort(key=lambda r: r.get('published_at') or r.get('created_at') or '')
+          if len(releases) >= 100:
+              raise SystemExit('Source has 100+ releases; pagination required before claiming success.')
+
+          for release in releases:
+              tag = release['tag_name']
+              print(f"Copying release {tag}", flush=True)
+              with tempfile.TemporaryDirectory(prefix='flyppttimer-release-') as tmp:
+                  folder = Path(tmp)
+                  notes_path = folder / 'notes.md'
+                  notes_path.write_text(
+                      (release.get('body') or '').replace(
+                          f'https://github.com/{source}', f'https://github.com/{dest}'
+                      ), encoding='utf-8'
+                  )
+                  title = release.get('name') or tag
+                  check = subprocess.run(
+                      ['gh','release','view',tag,'--repo',dest],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                  )
+                  if check.returncode == 0:
+                      gh('release','edit',tag,'--repo',dest,'--title',title,'--notes-file',notes_path)
+                  else:
+                      opts = ['--draft'] if release.get('draft') else []
+                      if release.get('prerelease'):
+                          opts += ['--prerelease']
+                      gh('release','create',tag,'--repo',dest,'--verify-tag',
+                         '--title',title,'--notes-file',notes_path,*opts)
+
+                  assets = release.get('assets') or []
+                  if assets:
+                      downloads = folder / 'assets'
+                      downloads.mkdir()
+                      gh('release','download',tag,'--repo',source,'--dir',downloads)
+                      paths = sorted(p for p in downloads.iterdir() if p.is_file())
+                      expected = sorted(a['name'] for a in assets)
+                      if sorted(p.name for p in paths) != expected:
+                          raise SystemExit(f'Asset file mismatch for {tag}')
+                      gh('release','upload',tag,*paths,'--repo',dest,'--clobber')
+                  print(f"Copied release {tag}: {len(assets)} assets", flush=True)
+          PY
+
+      - name: Validate source and destination release counts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, subprocess, os
+          def releases(repo):
+              return json.loads(subprocess.check_output(
+                  ['gh','api',f'repos/{repo}/releases?per_page=100'],text=True))
+          src = releases(os.environ['SOURCE_REPO'])
+          dst = releases(os.environ['DEST_REPO'])
+          a = {r['tag_name']: sorted(x['name'] for x in r.get('assets',[])) for r in src}
+          b = {r['tag_name']: sorted(x['name'] for x in r.get('assets',[])) for r in dst}
+          if a != b:
+              raise SystemExit('Release tags or asset names differ: migration incomplete.')
+          print(f'Verified {len(a)} releases and {sum(map(len, a.values()))} assets.')
+          PY
